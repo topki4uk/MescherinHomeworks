@@ -1,176 +1,240 @@
-/*
- * simple_elf_dump.c
- * Минимальный пример работы с ELF через libelf.
- *
- * Сборка:
- *   gcc -Wall -o simple_elf_dump simple_elf_dump.c -lelf
- */
+#include "strip_header.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <libelf.h>
-#include <gelf.h>
-#include <string.h>
-
-
-int main(int argc, char **argv) {
-    int in_fd, out_fd;
-    Elf *in_elf, *out_elf; 
-
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <elf-file>\n", argv[0]);
-        return 1;
-    }
-
+int InitLibElf() {
     if (elf_version(EV_CURRENT) == EV_NONE) {
-        fprintf(stderr, "libelf init failed\n");
+        printf("libelf init failed\n");
         return 1;
     }
 
-    if ((in_fd = open(argv[1], O_RDONLY)) < 0) {
-        perror("open");
+    return 0;
+}
+
+int OpenElf(char* const filename, int* fd, int const fd_flag, Elf** elf, Elf_Cmd const elf_mode) {
+    if ((*fd = open(filename, fd_flag)) < 0) {
+        printf("open failed: %s\n", strerror(errno));
         return 1;
     }
 
-    if ((in_elf = elf_begin(in_fd, ELF_C_READ, NULL)) == NULL) {
-        fprintf(stderr, "elf_begin failed: %s\n", elf_errmsg(-1));
-        close(in_fd);
-        return 1;
-    }
-
-    if (elf_kind(in_elf) != ELF_K_ELF) {
-        fprintf(stderr, "%s is not an ELF file\n", argv[1]);
-        elf_end(in_elf);
-        close(in_fd);
-        return 1;
-    }
-
-    if ((out_fd = open("out", O_WRONLY | O_CREAT, 0644)) < 0) {
-        perror("open");
+    if ((*elf = elf_begin(*fd, elf_mode, NULL)) == NULL) {
+        printf("elf_begin failed: %s\n", elf_errmsg(-1));
+        close(*fd);
         return 1;
     }
     
-    if ((out_elf = elf_begin(out_fd, ELF_C_WRITE, NULL)) == NULL) {
-        fprintf(stderr, "elf_begin failed: %s\n", elf_errmsg(-1));
-        close(out_fd);
+    return 0;
+}
+
+int CreatElf(char* const filename, int* fd, int const fd_flag, 
+                int const creat_flag, Elf** elf, Elf_Cmd const elf_mode) {
+    if ((*fd = open(filename, fd_flag, creat_flag)) < 0) {
+        printf("open failed: %s\n", strerror(errno));
+        return 1;
+    }
+    
+    if ((*elf = elf_begin(*fd, elf_mode, NULL)) == NULL) {
+        printf("elf_begin failed: %s\n", elf_errmsg(-1));
+        close(*fd);
         return 1;
     }
 
+    return 0;
+}
+
+void CloseElf(int const fd, Elf* const elf) {
+    close(fd);
+    elf_end(elf);
+}
+
+int ExtractArguments(int const argc, char** const argv, char** filename, int* debug_flag) {
+    if (argc < 2) {
+        printf("Usage: %s [-d] <elf-file>\n", argv[0]);
+        return 1;
+    }
+
+    if (argc == 2) {
+        *filename = argv[1];
+    }
+    
+    if (argc == 3) {
+        if (strcmp("-d", argv[1]) != 0) {
+            printf("Usage: %s [-d] <elf-file>\n", argv[0]);
+            return 1;
+        }
+
+        *debug_flag = strcmp("-d", argv[1]) == 0;
+        *filename = argv[2];
+    }
+
+    return 0;
+}
+
+int CopyElfHeader(Elf* const in_elf, Elf* const out_elf, GElf_Ehdr *in_ehdr, GElf_Ehdr **out_ehdr) {
     // Заголовок ELF
-    GElf_Ehdr ehdr;
-    if (gelf_getehdr(in_elf, &ehdr) == NULL) {
-        fprintf(stderr, "gelf_getehdr failed: %s\n", elf_errmsg(-1));
-        elf_end(in_elf);
-        close(in_fd);
+    if (gelf_getehdr(in_elf, in_ehdr) == NULL) {
+        printf("gelf_getehdr failed: %s\n", elf_errmsg(-1));
         return 1;
     }
 
     // Create new ELF header
-    GElf_Ehdr *out_ehdr = gelf_newehdr(out_elf, ELFCLASS64);
+    *out_ehdr = gelf_newehdr(out_elf, ELFCLASS64);
     if (!out_ehdr) {
-        fprintf(stderr, "elf64_newehdr failed: %s\n", elf_errmsg(-1));
-        elf_end(out_elf);
-        close(out_fd);
+        printf("gelf_newehdr failed: %s\n", elf_errmsg(-1));
         return 1;
     }
 
-    out_ehdr->e_ident[EI_MAG0] = ehdr.e_ident[EI_MAG0];
-    out_ehdr->e_ident[EI_MAG1] = ehdr.e_ident[EI_MAG1];
-    out_ehdr->e_ident[EI_MAG2] = ehdr.e_ident[EI_MAG2];
-    out_ehdr->e_ident[EI_MAG3] = ehdr.e_ident[EI_MAG3];
-    out_ehdr->e_ident[EI_CLASS] = ehdr.e_ident[EI_CLASS];
-    out_ehdr->e_ident[EI_DATA]  = ehdr.e_ident[EI_DATA];
-    out_ehdr->e_ident[EI_VERSION] = ehdr.e_ident[EI_VERSION];
+    **out_ehdr = *in_ehdr;
+    return 0;
+}
 
-    out_ehdr->e_type    = ehdr.e_type;
-    out_ehdr->e_machine = ehdr.e_machine;
-    out_ehdr->e_version = ehdr.e_version;
+int CopyElfSectionData(Elf_Scn *in_scn, Elf_Data *in_data, Elf_Scn *out_scn, Elf_Data *out_data) {
+    while ((in_data = elf_getdata(in_scn, in_data)) != NULL) {
+        if ((out_data = elf_newdata(out_scn)) == NULL) {
+            printf("elf_newdata failed: %s\n", elf_errmsg(-1));
+            return 1;
+        }
 
-    size_t shstrndx;
+        *out_data = *in_data;
+    }
+
+    return 0;
+}
+
+int CopyElfSections(Elf* in_elf, Elf* out_elf, GElf_Ehdr *out_ehdr, size_t shstrndx, int const debug_mode) {
     Elf_Scn *out_scn = NULL, *in_scn = NULL;
     Elf_Data *out_data = NULL, *in_data = NULL;
     GElf_Shdr in_shdr, out_shdr;
 
     while ((in_scn = elf_nextscn(in_elf, in_scn)) != NULL) {
-        if ((out_scn = elf_newscn(out_elf)) == NULL) {
-            fprintf(stderr, "elf_newscn failed: %s\n", elf_errmsg(-1));
-            elf_end(out_elf);
-            close(out_fd);
+        if (gelf_getshdr(in_scn, &in_shdr) == NULL) {
+            printf("elf64_getshdr failed: %s\n", elf_errmsg(-1));
             return 1;
         }
 
-        if (gelf_getshdr(in_scn, &in_shdr) == NULL) {
-            fprintf(stderr, "elf64_getshdr failed: %s\n", elf_errmsg(-1));
-            elf_end(in_elf);
-            close(in_fd);
+        const char *name = elf_strptr(in_elf, shstrndx, in_shdr.sh_name);
+
+        if (strstr(name, "debug") != NULL) {
+            out_ehdr->e_shstrndx--;
+            continue;
+        }
+
+        if (debug_mode == 0 && strcmp(name, ".symtab") == 0) {
+            out_ehdr->e_shstrndx--;
+            continue;
+        }
+
+        if ((out_scn = elf_newscn(out_elf)) == NULL) {
+            printf("elf_newscn failed: %s\n", elf_errmsg(-1));
             return 1;
         }
 
         if (gelf_getshdr(out_scn, &out_shdr) == NULL) {
-            fprintf(stderr, "elf64_getshdr failed: %s\n", elf_errmsg(-1));
-            elf_end(out_elf);
-            close(out_fd);
+            printf("elf64_getshdr failed: %s\n", elf_errmsg(-1));
             return 1;
         }
 
-        out_shdr.sh_name = in_shdr.sh_name;
-        out_shdr.sh_type = in_shdr.sh_type;
-        out_shdr.sh_flags = in_shdr.sh_flags;
-        out_shdr.sh_entsize = in_shdr.sh_entsize;
-        out_shdr.sh_addralign = in_shdr.sh_addralign;
-        out_shdr.sh_info = in_shdr.sh_info;
-        out_shdr.sh_size = in_shdr.sh_size;
+        out_shdr = in_shdr;
         gelf_update_shdr(out_scn, &out_shdr);
 
-        while ((in_data = elf_getdata(in_scn, in_data)) != NULL) {
-            if ((out_data = elf_newdata(out_scn)) == NULL) {
-                fprintf(stderr, "elf_newdata failed: %s\n", elf_errmsg(-1));
-                elf_end(out_elf);
-                close(out_fd);
-                return 1;
-            }
-
-            out_data->d_align = out_shdr.sh_addralign;
-            out_data->d_buf = in_data->d_buf;
-            out_data->d_size = in_data->d_size;
-            out_data->d_off = in_data->d_off;
+        if (CopyElfSectionData(in_scn, in_data, out_scn, out_data) == 1) {
+            return 1;
         }
     }
 
+    return 0;
+}
+
+int CopyProgramHeaders(Elf *in_elf, Elf *out_elf, GElf_Ehdr in_ehdr) {
     Elf64_Phdr *in_phdr, *out_phdr;
     if ((in_phdr = elf64_getphdr(in_elf)) == NULL) {
-        fprintf(stderr, "elf64_getphdr failed: %s\n", elf_errmsg(-1));
-        elf_end(in_elf);
-        close(in_fd);
+        printf("elf64_getphdr failed: %s\n", elf_errmsg(-1));
         return 1;
     }
 
-    if ((out_phdr = elf64_newphdr(out_elf, ehdr.e_phnum)) == NULL) {
-        fprintf(stderr, "elf64_newphdr failed: %s\n", elf_errmsg(-1));
-        elf_end(out_elf);
-        close(out_fd);
+    if ((out_phdr = elf64_newphdr(out_elf, in_ehdr.e_phnum)) == NULL) {
+        printf("elf64_newphdr failed: %s\n", elf_errmsg(-1));
         return 1;
     }
 
-    for (int i = 0; i < ehdr.e_phnum; i++) {
-        out_phdr[i].p_type = in_phdr[i].p_type;
-        out_phdr[i].p_offset = in_phdr[i].p_offset;
-        out_phdr[i].p_vaddr = in_phdr[i].p_vaddr;
-        out_phdr[i].p_filesz = in_phdr[i].p_filesz;
-        out_phdr[i].p_memsz = in_phdr[i].p_memsz;
+    for (int i = 0; i < in_ehdr.e_phnum; i++) {
+        out_phdr[i] = in_phdr[i];
     }
 
-    // elf_flagelf(out_elf, ELF_C_SET, ELF_F_LAYOUT);
+    return 0;
+}
 
+int main(int argc, char **argv) {
+    char* filename;
+    int debug_mode;
+    if (ExtractArguments(argc, argv, &filename, &debug_mode) == 1) {
+        return 1;
+    }
+    if (debug_mode == 1) {
+        printf("Strip only debug sections\n");
+    } else {
+        printf("Strip debug and symtab sections\n");
+    }
+
+    if (InitLibElf() == 1) {
+        return 1;
+    }
+
+    int in_fd;
+    Elf *in_elf; 
+    if (OpenElf(filename, &in_fd, O_RDONLY, &in_elf, ELF_C_READ) == 1) {
+        return 1;
+    }
+
+    if (elf_kind(in_elf) != ELF_K_ELF) {
+        printf("%s is not an ELF file\n", argv[1]);
+        CloseElf(in_fd, in_elf);
+        return 1;
+    }
+
+    int out_fd;
+    Elf *out_elf;
+    char stripped_filename[100] = "stripped_";
+    strcat(stripped_filename, filename);
+    if (CreatElf(stripped_filename, &out_fd, O_WRONLY | O_CREAT, 0755, &out_elf, ELF_C_WRITE) == 1) {
+        return 1;
+    }
+
+    GElf_Ehdr in_ehdr, *out_ehdr;
+    if (CopyElfHeader(in_elf, out_elf, &in_ehdr, &out_ehdr) == 1) {
+        CloseElf(in_fd, in_elf);
+        CloseElf(out_fd, out_elf);
+        return 1;
+    }
+
+    size_t shstrndx;
+    if (elf_getshdrstrndx(in_elf, &shstrndx) != 0) {
+        printf("elf_getshdrstrndx: %s\n", elf_errmsg(-1));
+        CloseElf(in_fd, in_elf);
+        CloseElf(out_fd, out_elf);
+        return 1;
+    }
+
+    if (CopyElfSections(in_elf, out_elf, out_ehdr, shstrndx, debug_mode) == 1) {
+        CloseElf(in_fd, in_elf);
+        CloseElf(out_fd, out_elf);
+        return 1;
+    }
+
+    if (CopyProgramHeaders(in_elf, out_elf, in_ehdr) == 1) {
+        CloseElf(in_fd, in_elf);
+        CloseElf(out_fd, out_elf);
+        return 1;
+    }
+
+    elf_flagelf(out_elf, ELF_C_SET, ELF_F_LAYOUT);
     if (elf_update(out_elf, ELF_C_WRITE) < 0) {
-        fprintf(stderr, "elf_update failed: %s\n", elf_errmsg(-1));
+        printf("elf_update failed: %s\n", elf_errmsg(-1));
+        CloseElf(in_fd, in_elf);
+        CloseElf(out_fd, out_elf);
+        return 1;
     }
 
-    elf_end(out_elf);
-    elf_end(in_elf);
-    close(in_fd);
-    close(out_fd);
+    printf("Successfully created stripped ELF file: %s\n", stripped_filename);
+    CloseElf(in_fd, in_elf);
+    CloseElf(out_fd, out_elf);
     return 0;
 }
