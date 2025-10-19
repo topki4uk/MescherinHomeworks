@@ -117,7 +117,7 @@ int CopyElfSections(Elf* in_elf, Elf* out_elf, GElf_Ehdr *out_ehdr, size_t shstr
             continue;
         }
 
-        if (debug_mode == 0 && strcmp(name, ".symtab") == 0) {
+        if (debug_mode == 0 && strcmp(name, ".symtab") == 0) {    
             out_ehdr->e_shstrndx--;
             continue;
         }
@@ -164,10 +164,11 @@ int CopyProgramHeaders(Elf *in_elf, Elf *out_elf, GElf_Ehdr in_ehdr) {
 
 int main(int argc, char **argv) {
     char* filename;
-    int debug_mode;
+    int debug_mode = 0;
     if (ExtractArguments(argc, argv, &filename, &debug_mode) == 1) {
         return 1;
     }
+
     if (debug_mode == 1) {
         printf("Strip only debug sections\n");
     } else {
