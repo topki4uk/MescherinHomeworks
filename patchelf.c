@@ -21,18 +21,6 @@ struct ProgramMode {
     char *filename;
 };
 
-void print_program_mode(const struct ProgramMode *mode) {
-    printf("Program Mode Configuration:\n");
-    printf("  status: %s\n", !mode->status ? "OK" : "Bad");
-    printf("  set_runpath: %d\n", mode->set_runpath);
-    printf("  runpath: %s\n", mode->runpath ? mode->runpath : "(null)");
-    printf("  set_interp: %d\n", mode->set_interp);
-    printf("  interp: %s\n", mode->interp ? mode->interp : "(null)");
-    printf("  print_runpath: %d\n", mode->print_runpath);
-    printf("  print_interp: %d\n", mode->print_interp);
-    printf("  filename: %s\n", mode->filename ? mode->filename : "(null)");
-}
-
 struct ProgramMode GetMode(int argc, char **argv) {
     struct ProgramMode mode = {0};
 
@@ -69,28 +57,6 @@ struct ProgramMode GetMode(int argc, char **argv) {
 
     mode.filename = argv[argc - 1];
     return mode;
-}
-
-size_t vaddr_to_offset(Elf *elf, GElf_Addr vaddr) {
-    size_t n;
-    if (elf_getphdrnum(elf, &n) != 0) {
-        return 0;
-    }
-    
-    for (size_t i = 0; i < n; i++) {
-        GElf_Phdr phdr;
-        if (gelf_getphdr(elf, i, &phdr) != &phdr) {
-            continue;
-        }
-        
-        // Проверяем, попадает ли виртуальный адрес в этот сегмент
-        if (vaddr >= phdr.p_vaddr && vaddr < phdr.p_vaddr + phdr.p_memsz) {
-            // Вычисляем смещение в файле
-            return phdr.p_offset + (vaddr - phdr.p_vaddr);
-        }
-    }
-    
-    return 0;
 }
 
 void print_usage(const char *program_name) {
@@ -198,7 +164,6 @@ int ExtractRunpath(Elf *elf) {
             }
             
             runpath = (const char *)dynstr_data->d_buf + dyn.d_un.d_val;
-            printf("%ld\n", dynstr_data->d_size + dyn.d_un.d_val);
             break;
         }
     }
@@ -212,24 +177,18 @@ int ExtractRunpath(Elf *elf) {
     return 0;
 }
 
-int RewriteRunpath(int fd, Elf *elf, const char *new_runpath) {
-    size_t runpath_offset;
-    char *runpath_addr;
-    const char *old_runpath;
-
+int GetSectionHeaderOffset(Elf* elf, Elf_Data** dyn_data, GElf_Shdr* dyn_shdr, int sh_type, size_t* dynstr_offset) {
     size_t shstrndx;
-    size_t dynstr_offset;
-    if (elf_getshdrstrndx(elf, &shstrndx) != 0) {
-        fprintf(stderr, "Ошибка получения индекса строк секций: %s\n", elf_errmsg(-1));
-        return -1;
-    }
 
     GElf_Shdr shdr;
     Elf_Scn *scn = NULL;
     Elf_Data *data = NULL;
 
-    Elf_Data *dyn_data = NULL;
-    GElf_Shdr dyn_shdr;
+    if (elf_getshdrstrndx(elf, &shstrndx) != 0) {
+        fprintf(stderr, "Ошибка получения индекса строк секций: %s\n", elf_errmsg(-1));
+        return 1;
+    }
+
     while ((scn = elf_nextscn(elf, scn)) != NULL) {
         char* name;
         
@@ -244,76 +203,17 @@ int RewriteRunpath(int fd, Elf *elf, const char *new_runpath) {
             continue;
         }
 
-        if (shdr.sh_type == SHT_DYNAMIC) {
+        if (shdr.sh_type == sh_type) {
             data = elf_getdata(scn, NULL);
             if (data != NULL && data->d_size > 0) {
-                dyn_data = data;
-                dyn_shdr = shdr;
+                *dyn_data = data;
+                *dyn_shdr = shdr;
             }
         }
         
         if (strcmp(name, ".dynstr") == 0) {
-            dynstr_offset = shdr.sh_offset;
+            *dynstr_offset = shdr.sh_offset;
         }
-    }
-
-    size_t entries_count = dyn_data->d_size / sizeof(GElf_Dyn);
-    GElf_Dyn dyn;
-
-    for (size_t i = 0; i < entries_count; i++) {
-        if (gelf_getdyn(dyn_data, i, &dyn) != &dyn) {
-            continue;
-        }
-        
-        if (dyn.d_tag == DT_RUNPATH) {
-            Elf_Scn *dynstr_scn = elf_getscn(elf, dyn_shdr.sh_link);
-            if (dynstr_scn == NULL) {
-                printf("elf_getscn: %s\n", elf_errmsg(-1));
-                return 1;
-            }
-            
-            Elf_Data *dynstr_data = elf_getdata(dynstr_scn, NULL);
-            if (dynstr_data == NULL) {
-                printf("elf_getdata: %s\n", elf_errmsg(-1));
-                return 1;
-            }
-            
-            runpath_addr = (char *)dynstr_data->d_buf + dyn.d_un.d_val;
-            old_runpath = (const char *)dynstr_data->d_buf + dyn.d_un.d_val;
-            dynstr_offset += dyn.d_un.d_val;
-            break;
-        }
-    }
-
-    if (old_runpath != NULL) {
-        size_t new_runpath_len = strlen(new_runpath);
-        size_t old_runpath_len = strlen(old_runpath);
-
-        printf("%ld\n", old_runpath_len);
-        printf("%s -> %s\n", old_runpath, new_runpath);
-
-        if (new_runpath_len > old_runpath_len) {
-            printf("new rpath is too long\n");
-            return 1;
-        }
-
-        if (lseek(fd, dynstr_offset, SEEK_SET) < 0) {
-            printf("lseek failed\n");
-            return 1;
-        }
-
-        char buffer[256] = {};
-        for (size_t i = 0; i < new_runpath_len; ++i) {
-            buffer[i] = new_runpath[i];
-        }
-        // for (size_t i = new_runpath_len; i < old_runpath_len; ++i) {
-        //     buffer[i] = '\1';
-        // }
-
-        write(fd, buffer, old_runpath_len + 1);
-    } else {
-        printf("no RUNPATH found\n");
-        return 1;
     }
 
     return 0;
@@ -341,17 +241,127 @@ int GetPHeader(Elf *elf, GElf_Phdr *phdr, Elf64_Word program_type) {
     return 1;
 }
 
+int FindStrOffset(Elf* elf, GElf_Shdr dyn_shdr, Elf_Data* dyn_data, GElf_Dyn* dyn, char** runpath_addr) {
+    size_t dynstr_offset = dyn_shdr.sh_offset;
+    size_t entries_count = dyn_data->d_size / sizeof(GElf_Dyn);
+
+    for (size_t i = 0; i < entries_count; i++) {
+        if (gelf_getdyn(dyn_data, i, dyn) == NULL) {
+            continue;
+        }
+        
+        if (dyn->d_tag == DT_RUNPATH) {
+            Elf_Scn *dynstr_scn = elf_getscn(elf, dyn_shdr.sh_link);
+            if (dynstr_scn == NULL) {
+                printf("elf_getscn: %s\n", elf_errmsg(-1));
+                return 1;
+            }
+            
+            Elf_Data *dynstr_data = elf_getdata(dynstr_scn, NULL);
+            if (dynstr_data == NULL) {
+                printf("elf_getdata: %s\n", elf_errmsg(-1));
+                return 1;
+            }
+            
+            *runpath_addr = (char *)dynstr_data->d_buf + dyn->d_un.d_val;
+            break;
+        }
+    }
+}
+
+int RewriteRunpath(int fd, Elf *elf, const char *new_runpath) {
+    size_t dynstr_offset = 0;
+    char *runpath_addr = NULL;
+    const char* old_runpath;
+
+    GElf_Dyn dyn;
+    Elf_Data *dyn_data = NULL;
+    GElf_Shdr dyn_shdr;
+
+    if (GetSectionHeaderOffset(elf, &dyn_data, &dyn_shdr, SHT_DYNAMIC, &dynstr_offset) == 1) {
+        return 1;
+    }
+    
+    FindStrOffset(elf, dyn_shdr, dyn_data, &dyn, &runpath_addr);
+    old_runpath = (const char* )runpath_addr;
+    dynstr_offset += dyn.d_un.d_val;
+
+    if (runpath_addr != NULL) {
+        size_t new_runpath_len = strlen(new_runpath);
+        size_t old_runpath_len = strlen(old_runpath);
+
+        while (*(runpath_addr + old_runpath_len) == '\0') {
+            runpath_addr++;
+            old_runpath_len++;
+        }
+
+        if (new_runpath_len > old_runpath_len) {
+            printf("new rpath is too long\n");
+            return 1;
+        }
+
+        if (lseek(fd, dynstr_offset, SEEK_SET) < 0) {
+            printf("lseek failed\n");
+            return 1;
+        }
+
+        char buffer[256] = {};
+        for (size_t i = 0; i < new_runpath_len; ++i) {
+            buffer[i] = new_runpath[i];
+        }
+
+        write(fd, buffer, old_runpath_len + 1);
+        printf("%s -> %s\n", old_runpath, new_runpath);
+    } else {
+        printf("no RUNPATH found\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+int RewriteInterp(int fd, Elf* elf, const char* new_interp) {
+    GElf_Phdr phdr;
+    size_t new_interp_len = strlen(new_interp);
+
+    if (GetPHeader(elf, &phdr, PT_INTERP) == 1) {
+        return 1;
+    }
+
+    size_t interp_offset = phdr.p_offset;
+    if (new_interp_len > phdr.p_memsz) {
+        printf("new iterp path is too long\n");
+        return 1;
+    }
+
+    if (lseek(fd, phdr.p_offset, SEEK_SET) < 0) {
+        printf("lseek failed\n");
+        return 1;
+    }
+
+    char buffer[256] = {};
+    for (size_t i = 0; i < new_interp_len; ++i) {
+        buffer[i] = new_interp[i];
+    }
+
+    if (write(fd, buffer, phdr.p_memsz) < 0) {
+        printf("write failed\n");
+        return 1;
+    }
+    return 0;
+}
+
 int GetInterp(int fd, GElf_Phdr phdr) {
     char buffer[256];
     size_t buffer_size = sizeof(buffer);
     if (lseek(fd, phdr.p_offset, SEEK_SET) < 0) {
-        perror("Ошибка позиционирования");
+        printf("lseek failed\n");
         return 1;
     }
 
-    ssize_t bytes_read = read(fd, buffer, phdr.p_memsz);
+    size_t bytes_read = read(fd, buffer, phdr.p_memsz);
     if (bytes_read < 0) {
-        perror("Ошибка чтения интерпретатора");
+        perror("read failed\n");
         return 1;
     }
 
@@ -397,13 +407,17 @@ int SetRunpath(int fd, Elf *elf, const char* new_runpath) {
     if (RewriteRunpath(fd, elf, new_runpath) == 1) {
         return 1;
     }
-
-    // if (elf_update(elf, ELF_C_WRITE) < 0) {
-    //     printf("elf_update: %s\n", elf_errmsg(-1));
-    //     return 1;
-    // }
-
     return 0;
+}
+
+int SetInterp(int fd, Elf* elf, const char* new_interp) {
+    if (HasPHeader(elf, PT_INTERP) == 1) {
+        return 1;
+    }
+
+    if (RewriteInterp(fd, elf, new_interp) == 1) {
+        return 1;
+    }
 }
 
 int OpenElf(char* const filename, int* fd, int const fd_flag, Elf** elf, Elf_Cmd const elf_mode) {
@@ -464,7 +478,10 @@ int main(int argc, char **argv) {
     }
 
     if (mode.set_interp == 1) {
-        
+        if (SetInterp(in_fd, in_elf, mode.interp) == 1) {
+            CloseElf(in_fd, in_elf);
+            return 1;
+        }
     }
 
     CloseElf(in_fd, in_elf);
