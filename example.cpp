@@ -1,5 +1,7 @@
 #include <iostream>
 
+int square(int);
+
 int main() {
-    std::cout << "hello, world\n";
+    std::cout << square(5) << std::endl;
 }

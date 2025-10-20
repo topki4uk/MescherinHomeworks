@@ -71,6 +71,28 @@ struct ProgramMode GetMode(int argc, char **argv) {
     return mode;
 }
 
+size_t vaddr_to_offset(Elf *elf, GElf_Addr vaddr) {
+    size_t n;
+    if (elf_getphdrnum(elf, &n) != 0) {
+        return 0;
+    }
+    
+    for (size_t i = 0; i < n; i++) {
+        GElf_Phdr phdr;
+        if (gelf_getphdr(elf, i, &phdr) != &phdr) {
+            continue;
+        }
+        
+        // Проверяем, попадает ли виртуальный адрес в этот сегмент
+        if (vaddr >= phdr.p_vaddr && vaddr < phdr.p_vaddr + phdr.p_memsz) {
+            // Вычисляем смещение в файле
+            return phdr.p_offset + (vaddr - phdr.p_vaddr);
+        }
+    }
+    
+    return 0;
+}
+
 void print_usage(const char *program_name) {
     printf("Usage: %s [OPTIONS] <elf-file>\n\n", program_name);
     printf("A stupid ass patchelf utility for modifying and inspecting ELF files.\n\n");
@@ -190,55 +212,75 @@ int ExtractRunpath(Elf *elf) {
     return 0;
 }
 
-int RewriteRunpath(Elf *elf, const char *new_runpath) {
-    Elf_Scn *scn = NULL;
+int RewriteRunpath(int fd, Elf *elf, const char *new_runpath) {
+    size_t runpath_offset;
+    char *runpath_addr;
+    const char *old_runpath;
+
+    size_t shstrndx;
+    size_t dynstr_offset;
+    if (elf_getshdrstrndx(elf, &shstrndx) != 0) {
+        fprintf(stderr, "Ошибка получения индекса строк секций: %s\n", elf_errmsg(-1));
+        return -1;
+    }
+
     GElf_Shdr shdr;
+    Elf_Scn *scn = NULL;
     Elf_Data *data = NULL;
 
+    Elf_Data *dyn_data = NULL;
+    GElf_Shdr dyn_shdr;
     while ((scn = elf_nextscn(elf, scn)) != NULL) {
+        char* name;
+        
         if (gelf_getshdr(scn, &shdr) != &shdr) {
+            fprintf(stderr, "Ошибка получения заголовка секции: %s\n", elf_errmsg(-1));
             continue;
         }
         
+        name = elf_strptr(elf, shstrndx, shdr.sh_name);
+        if (name == NULL) {
+            fprintf(stderr, "Ошибка получения имени секции: %s\n", elf_errmsg(-1));
+            continue;
+        }
+
         if (shdr.sh_type == SHT_DYNAMIC) {
             data = elf_getdata(scn, NULL);
             if (data != NULL && data->d_size > 0) {
-                break;
+                dyn_data = data;
+                dyn_shdr = shdr;
             }
+        }
+        
+        if (strcmp(name, ".dynstr") == 0) {
+            dynstr_offset = shdr.sh_offset;
         }
     }
 
-    if (data == NULL) {
-        printf("no dynamic section found\n");
-        return 1;
-    }
-
-    size_t entries_count = data->d_size / sizeof(GElf_Dyn);
+    size_t entries_count = dyn_data->d_size / sizeof(GElf_Dyn);
     GElf_Dyn dyn;
-    Elf_Data *dynstr_data = NULL;
-    const char *old_runpath = NULL;
-    char *runpath_addr = NULL;
 
     for (size_t i = 0; i < entries_count; i++) {
-        if (gelf_getdyn(data, i, &dyn) != &dyn) {
+        if (gelf_getdyn(dyn_data, i, &dyn) != &dyn) {
             continue;
         }
         
         if (dyn.d_tag == DT_RUNPATH) {
-            Elf_Scn *dynstr_scn = elf_getscn(elf, shdr.sh_link);
+            Elf_Scn *dynstr_scn = elf_getscn(elf, dyn_shdr.sh_link);
             if (dynstr_scn == NULL) {
                 printf("elf_getscn: %s\n", elf_errmsg(-1));
                 return 1;
             }
             
-            dynstr_data = elf_getdata(dynstr_scn, NULL);
+            Elf_Data *dynstr_data = elf_getdata(dynstr_scn, NULL);
             if (dynstr_data == NULL) {
                 printf("elf_getdata: %s\n", elf_errmsg(-1));
                 return 1;
             }
             
-            old_runpath = (const char *)dynstr_data->d_buf + dyn.d_un.d_val;
             runpath_addr = (char *)dynstr_data->d_buf + dyn.d_un.d_val;
+            old_runpath = (const char *)dynstr_data->d_buf + dyn.d_un.d_val;
+            dynstr_offset += dyn.d_un.d_val;
             break;
         }
     }
@@ -246,6 +288,8 @@ int RewriteRunpath(Elf *elf, const char *new_runpath) {
     if (old_runpath != NULL) {
         size_t new_runpath_len = strlen(new_runpath);
         size_t old_runpath_len = strlen(old_runpath);
+
+        printf("%ld\n", old_runpath_len);
         printf("%s -> %s\n", old_runpath, new_runpath);
 
         if (new_runpath_len > old_runpath_len) {
@@ -253,15 +297,20 @@ int RewriteRunpath(Elf *elf, const char *new_runpath) {
             return 1;
         }
 
-        memcpy(runpath_addr, (const void *) new_runpath, new_runpath_len);
-        if (new_runpath_len < old_runpath_len) {
-            memset(runpath_addr + new_runpath_len, '0', old_runpath_len - new_runpath_len);
-        }
-
-        if (elf_flagdata(dynstr_data, ELF_C_SET, ELF_F_DIRTY) == 0) {
-            fprintf(stderr, "elf_flagdata failed: %s\n", elf_errmsg(-1));
+        if (lseek(fd, dynstr_offset, SEEK_SET) < 0) {
+            printf("lseek failed\n");
             return 1;
         }
+
+        char buffer[256] = {};
+        for (size_t i = 0; i < new_runpath_len; ++i) {
+            buffer[i] = new_runpath[i];
+        }
+        // for (size_t i = new_runpath_len; i < old_runpath_len; ++i) {
+        //     buffer[i] = '\1';
+        // }
+
+        write(fd, buffer, old_runpath_len + 1);
     } else {
         printf("no RUNPATH found\n");
         return 1;
@@ -340,20 +389,19 @@ int PrintInterp(int fd, Elf *elf) {
     return 0;
 }
 
-int SetRunpath(int fd, Elf *elf) {
+int SetRunpath(int fd, Elf *elf, const char* new_runpath) {
     if (HasPHeader(elf, PT_DYNAMIC) == 1) {
         return 1;
     }
 
-    const char* new_runpath = "aaa";
-    if (RewriteRunpath(elf, new_runpath) == 1) {
+    if (RewriteRunpath(fd, elf, new_runpath) == 1) {
         return 1;
     }
 
-    if (elf_update(elf, ELF_C_WRITE) < 0) {
-        printf("elf_update: %s\n", elf_errmsg(-1));
-        return 1;
-    }
+    // if (elf_update(elf, ELF_C_WRITE) < 0) {
+    //     printf("elf_update: %s\n", elf_errmsg(-1));
+    //     return 1;
+    // }
 
     return 0;
 }
@@ -409,7 +457,7 @@ int main(int argc, char **argv) {
     }
 
     if (mode.set_runpath == 1) {
-        if (SetRunpath(in_fd, in_elf) == 1) {
+        if (SetRunpath(in_fd, in_elf, mode.runpath) == 1) {
             CloseElf(in_fd, in_elf);
             return 1;
         }
