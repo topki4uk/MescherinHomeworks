@@ -1,3 +1,3 @@
 #!/bin/bash
-g++ main.cpp -o mytop
+g++ main.cpp -fsanitize=address -o mytop
 ./mytop
